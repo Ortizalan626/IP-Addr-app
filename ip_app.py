@@ -323,6 +323,17 @@ class IPUtilityApp:
 
         self.root.after(10, self._startup_async)
 
+    def _collect_netsh_error_lines(self, out: str, err: str):
+        combined = "\n".join([out or "", err or ""]).strip()
+        if not combined:
+            return []
+        bad_tokens = ("error", "failed", "cannot", "invalid", "denied")
+        return [
+            ln.strip()
+            for ln in combined.splitlines()
+            if ln.strip() and any(tok in ln.lower() for tok in bad_tokens)
+        ]
+
     # ------------------ STARTUP LOAD (DEFERRED) ------------------
     def _startup_load(self):
         # populate NICs (netsh can be slow)
@@ -675,6 +686,7 @@ class IPUtilityApp:
             "proc": None,
             "script": None,
             "batch_ips": None,
+            "netsh_errors": [],
         }
 
         self._add_run_next_batch()
@@ -691,6 +703,18 @@ class IPUtilityApp:
         pending = op["pending"]
         idx = op["index"]
         if idx >= len(pending):
+            current = set(get_assigned_ips(op["nic"], prefer="netsh"))
+            for ip in pending:
+                if ip in current:
+                    self.log(f"SUCCESS: {ip}")
+                    op["added"] += 1
+                else:
+                    self.log(f"ERROR adding {ip}: IP not observed after operation")
+                    op["errors"] += 1
+
+            for err_ln in op.get("netsh_errors", []):
+                self.log(f"netsh: {err_ln}")
+
             self.log(f"Finished. Added {op['added']}, skipped {op['skipped']}, errors {op['errors']}.")
             self._op = None
             self.refresh_assigned()
@@ -732,19 +756,9 @@ class IPUtilityApp:
 
         op["proc"] = None
         op["script"] = None
-
-        current = set(get_assigned_ips(op["nic"], prefer="netsh"))
-
-        for ip in op["batch_ips"]:
-            if ip in current:
-                self.log(f"SUCCESS: {ip}")
-                op["added"] += 1
-            else:
-                details = (err or out or "").strip()
-                if not details:
-                    details = f"(netsh completed rc={rc}, but IP not observed after batch)"
-                self.log(f"ERROR adding {ip}: {details}")
-                op["errors"] += 1
+        if rc != 0:
+            op["netsh_errors"].append(f"batch exited with code {rc}")
+        op["netsh_errors"].extend(self._collect_netsh_error_lines(out, err))
 
         self._progress_add(len(op["batch_ips"]))
         op["batch_ips"] = None
@@ -785,6 +799,7 @@ class IPUtilityApp:
             "proc": None,
             "script": None,
             "batch_ips": None,
+            "netsh_errors": [],
         }
 
         self._remove_run_next_batch()
@@ -824,6 +839,20 @@ class IPUtilityApp:
         ips = op["ips"]
         idx = op["index"]
         if idx >= len(ips):
+            current = set(get_assigned_ips(op["nic"], prefer="netsh"))
+            for ip in ips:
+                if ip not in current:
+                    self.log(f"SUCCESS removing {ip}")
+                    op["removed"] += 1
+                    if ip in self.assigned_checks:
+                        self.assigned_checks[ip] = False
+                else:
+                    self.log(f"ERROR removing {ip}: IP still observed after operation")
+                    op["errors"] += 1
+
+            for err_ln in op.get("netsh_errors", []):
+                self.log(f"netsh: {err_ln}")
+
             if op.get("mode") == "selected":
                 self.log(f"Finished removing selected: {op['removed']} removed. Errors {op['errors']}.")
             else:
@@ -865,21 +894,9 @@ class IPUtilityApp:
 
         op["proc"] = None
         op["script"] = None
-
-        current = set(get_assigned_ips(op["nic"], prefer="netsh"))
-
-        for ip in op["batch_ips"]:
-            if ip not in current:
-                self.log(f"SUCCESS removing {ip}")
-                op["removed"] += 1
-                if ip in self.assigned_checks:
-                    self.assigned_checks[ip] = False
-            else:
-                details = (err or out or "").strip()
-                if not details:
-                    details = f"(netsh completed rc={rc}, but IP still observed after batch)"
-                self.log(f"ERROR removing {ip}: {details}")
-                op["errors"] += 1
+        if rc != 0:
+            op["netsh_errors"].append(f"batch exited with code {rc}")
+        op["netsh_errors"].extend(self._collect_netsh_error_lines(out, err))
 
         self._progress_add(len(op["batch_ips"]))
         op["batch_ips"] = None
