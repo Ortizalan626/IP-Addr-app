@@ -1,18 +1,15 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 import subprocess
 import re
 from datetime import datetime
 import tempfile
 import os
 import threading
-import queue
-import time
 
-# ----------------------------- NET/VALIDATION -----------------------------
+# ----------------------------- NET / VALIDATION -----------------------------
 IP_PATTERN = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 CREATE_NO_WINDOW = 0x08000000
-
 BATCH_SIZE = 25
 
 CHECK_OFF = "☐"
@@ -25,13 +22,13 @@ def is_valid_ip(ip: str) -> bool:
         return False
     try:
         return all(0 <= int(x) <= 255 for x in ip.split("."))
-    except:
+    except Exception:
         return False
 
 
-def run_hidden(cmd_list):
+def run_hidden(cmd):
     return subprocess.run(
-        cmd_list,
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -39,9 +36,9 @@ def run_hidden(cmd_list):
     )
 
 
-def popen_hidden(cmd_list):
+def popen_hidden(cmd):
     return subprocess.Popen(
-        cmd_list,
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -53,7 +50,7 @@ def is_admin():
     try:
         r = run_hidden(["netsh", "interface", "ipv4", "show", "interfaces"])
         return r.returncode == 0
-    except:
+    except Exception:
         return False
 
 
@@ -66,39 +63,50 @@ def get_nics():
             if len(parts) >= 4 and parts[0] in ("Enabled", "Disabled"):
                 nics.append(" ".join(parts[3:]))
         return nics
-    except:
+    except Exception:
         return ["Ethernet"]
 
 
-def _get_assigned_ips_powershell(nic):
+# PowerShell getter (good for Refresh)
+def get_assigned_ips(nic):
     try:
         safe_nic = nic.replace("'", "''")
         ps_cmd = (
             f"try {{ "
-            f"Get-NetIPAddress -InterfaceAlias '{safe_nic}' -AddressFamily IPv4 -ErrorAction Stop "
+            f"Get-NetIPAddress -InterfaceAlias '{safe_nic}' -AddressFamily IPv4 "
             f"| Select-Object -ExpandProperty IPAddress "
             f"}} catch {{ }}"
         )
-        r = run_hidden(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd])
+
+        r = run_hidden([
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps_cmd
+        ])
+
         if r.returncode != 0:
-            return None
+            return []
 
         ips = []
         for line in (r.stdout or "").splitlines():
             ip = line.strip()
             if not ip:
                 continue
-            if not is_valid_ip(ip):
-                continue
-            if ip.startswith("169.254.") or ip in ("0.0.0.0",):
-                continue
-            ips.append(ip)
+            if is_valid_ip(ip) and not ip.startswith("169.254.") and ip != "0.0.0.0":
+                ips.append(ip)
+
         return ips
-    except:
-        return None
+
+    except Exception:
+        return []
 
 
+# ----------------------------- REMOVE/VERIFY HELPERS -----------------------------
 def _get_assigned_ips_netsh_parse(nic):
+    """Fast/robust verification source for deletes/adds (matches your working code idea)."""
     try:
         r = run_hidden(["netsh", "interface", "ipv4", "show", "addresses", f'name="{nic}"'])
         if r.returncode != 0:
@@ -115,40 +123,29 @@ def _get_assigned_ips_netsh_parse(nic):
                 if is_valid_ip(raw) and not raw.startswith("169.254.") and raw != "0.0.0.0":
                     ips.append(raw)
         return ips
-    except:
+    except Exception:
         return []
 
 
-def get_assigned_ips(nic, prefer: str = "powershell"):
+def get_assigned_ips_verify(nic):
     """
-    Return IPv4 addresses assigned to the given NIC (InterfaceAlias).
-
-    prefer:
-      - "powershell" (default): PowerShell first, then netsh fallback
-      - "netsh": netsh first (often faster on locked-down/corporate PCs), then PowerShell fallback
+    Use netsh parse for post-delete verification (more consistent with netsh operations).
+    Fall back to PowerShell getter if netsh returns nothing.
     """
-    prefer = (prefer or "powershell").lower().strip()
-
-    if prefer == "netsh":
-        ips = _get_assigned_ips_netsh_parse(nic)
-        if ips:
-            return ips
-        ips2 = _get_assigned_ips_powershell(nic)
-        return ips2 if ips2 is not None else ips
-
-    # default: PowerShell first (more direct API), then netsh fallback
-    ips = _get_assigned_ips_powershell(nic)
-    if ips is not None:
+    ips = _get_assigned_ips_netsh_parse(nic)
+    if ips:
         return ips
-    return _get_assigned_ips_netsh_parse(nic)
+    return get_assigned_ips(nic)
 
 
 # ----------------------------- TEXT WIDGET -----------------------------
-class SafeScrolledText(tk.Frame):
+class SafeScrolledText(ttk.Frame):
     def __init__(self, master, width=40, height=10):
         super().__init__(master)
+
         self.text = tk.Text(self, width=width, height=height, wrap="none")
-        self.scroll = tk.Scrollbar(self, command=self.text.yview)
+        self.scroll = ttk.Scrollbar(self, command=self.text.yview)
+
         self.text.configure(yscrollcommand=self.scroll.set)
 
         self.text.pack(side="left", fill="both", expand=True)
@@ -163,6 +160,7 @@ class SafeScrolledText(tk.Frame):
             ln = ln.strip()
             if not ln:
                 continue
+            # allow lines like "☐ 10.0.0.1" / "☑ 10.0.0.1"
             if ln.startswith(CHECK_OFF) or ln.startswith(CHECK_ON):
                 ln = ln[1:].strip()
             out.append(ln)
@@ -173,10 +171,9 @@ class SafeScrolledText(tk.Frame):
         self.text.delete("1.0", "end")
         if lines:
             self.text.insert("end", "\n".join(lines) + "\n")
-        self.text.see("end")
         self.text.configure(state="disabled" if self._readonly else "normal")
 
-    def append_line(self, line: str):
+    def append_line(self, line):
         self.text.configure(state="normal")
         self.text.insert("end", line + "\n")
         self.text.see("end")
@@ -185,10 +182,8 @@ class SafeScrolledText(tk.Frame):
     def clear(self):
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        self.text.see("end")
-        self.text.configure(state="disabled" if self._readonly else "normal")
 
-    def set_readonly(self, ro: bool):
+    def set_readonly(self, ro):
         self._readonly = ro
         self.text.configure(state="disabled" if ro else "normal")
 
@@ -198,244 +193,143 @@ class IPUtilityApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("IP Utility")
-        self.root.geometry("1000x780")
-        self.logs = []
-        self._op = None
-        self.assigned_checks = {}
+        self.root.geometry("1000x760")
 
-        # ------------------ TOP BAR ------------------
-        self.top = tk.Frame(self.root)
-        self.top.pack(fill="x", padx=10, pady=10)
+        # Native Windows theme
+        style = ttk.Style()
+        try:
+            style.theme_use("vista")
+        except Exception:
+            style.theme_use("default")
 
-        tk.Label(self.top, text="Network Adapter:").pack(side="left", padx=(0, 6))
+        self.root.option_add("*Font", ("Segoe UI", 9))
 
+        # Track check state for "Remove Selected"
+        self.assigned_checks = {}  # ip -> bool
+
+        # Startup warning only
+        if not is_admin():
+            messagebox.showwarning(
+                "Administrator Recommended",
+                "Some actions require Administrator.\n"
+                "If you see errors like 'requires elevation', run as Administrator."
+            )
+
+        # ---------------- TOP BAR ----------------
+        self.top = ttk.Frame(self.root)
+        self.top.pack(fill="x", padx=15, pady=10)
+
+        ttk.Label(self.top, text="Network Adapter:").pack(side="left")
         self.nic_var = tk.StringVar()
         self.nic_combo = ttk.Combobox(self.top, textvariable=self.nic_var, width=35, state="readonly")
-        self.nic_combo.pack(side="left", padx=(0, 20))
+        self.nic_combo.pack(side="left", padx=(5, 20))
 
-        tk.Label(self.top, text="Subnet Mask:").pack(side="left", padx=(0, 6))
-
-        self.mask_entry = tk.Entry(self.top, width=20)
+        ttk.Label(self.top, text="Subnet Mask:").pack(side="left")
+        self.mask_entry = ttk.Entry(self.top, width=20)
         self.mask_entry.insert(0, "255.255.254.0")
-        self.mask_entry.pack(side="left", padx=(0, 20))
+        self.mask_entry.pack(side="left", padx=(5, 20))
 
-        self.theme_var = tk.StringVar(value="Dark Mode")
-        self.theme_combo = ttk.Combobox(
-            self.top, textvariable=self.theme_var,
-            values=["Dark Mode", "Light Mode"],
-            width=20, state="readonly"
-        )
-        self.theme_combo.pack(side="right")
+        # ---------------- MAIN COLUMNS ----------------
+        self.columns = ttk.Frame(self.root)
+        self.columns.pack(fill="both", expand=True, padx=15)
 
-        # ------------------ MAIN COLUMNS ------------------
-        self.columns = tk.Frame(self.root)
-        self.columns.pack(fill="x", padx=10)
+        self.left = ttk.Frame(self.columns)
+        self.left.pack(side="left", expand=True, fill="both", padx=(0, 10))
 
-        # LEFT SIDE
-        self.left = tk.Frame(self.columns)
-        self.left.pack(side="left", padx=20)
+        self.right = ttk.Frame(self.columns)
+        self.right.pack(side="left", expand=True, fill="both")
 
-        self.left_label = tk.Label(self.left, text="Paste IPs Here")
-        self.left_label.pack(anchor="w")
+        ttk.Label(self.left, text="Paste IPs Here").pack(anchor="w")
+        self.input_box = SafeScrolledText(self.left, width=50, height=20)
+        self.input_box.pack(fill="both", expand=True)
 
-        self.input_box = SafeScrolledText(self.left, width=48, height=18)
-        self.input_box.pack()
-        self.input_box.set_readonly(False)
-
-        self.left_btns = tk.Frame(self.left)
-        self.left_btns.pack(fill="x", pady=10)
-
-        self.add_btn = tk.Button(self.left_btns, text="Add IPs to Adapter", command=self.add_ips)
-        self.add_btn.pack(side="left", expand=True, fill="x")
-
-        self.clear_btn = tk.Button(self.left_btns, text="Clear List", command=self.input_box.clear)
-        self.clear_btn.pack(side="left", expand=False, fill="x", padx=2)
-
-        self.excel_btn = tk.Button(self.left, text="Load from Excel", command=self.load_excel)
-        self.excel_btn.pack(fill="x")
-
-        # RIGHT SIDE
-        self.right = tk.Frame(self.columns)
-        self.right.pack(side="left", padx=20)
-
-        self.assigned_label = tk.Label(self.right, text="IPs Currently Assigned to Adapter:")
-        self.assigned_label.pack(anchor="w")
-
-        self.assigned_box = SafeScrolledText(self.right, width=48, height=18)
-        self.assigned_box.pack()
+        ttk.Label(self.right, text="IPs Currently Assigned to Adapter").pack(anchor="w")
+        self.assigned_box = SafeScrolledText(self.right, width=50, height=20)
+        self.assigned_box.pack(fill="both", expand=True)
         self.assigned_box.set_readonly(True)
 
-        # Remove row (horizontal buttons)
-        self.remove_row = tk.Frame(self.right)
-        self.remove_row.pack(fill="x", pady=(10, 5))
-
-        self.remove_btn = tk.Button(self.remove_row, text="Remove ALL Assigned IPs from Adapter", command=self.remove_all)
-        self.remove_btn.pack(side="left", expand=True, fill="x")
-
-        self.remove_selected_btn = tk.Button(self.remove_row, text="Remove Selected", command=self.remove_selected)
-        self.remove_selected_btn.pack(side="left", expand=False, fill="x", padx=(6, 0))
-
-        self.refresh_btn = tk.Button(self.right, text="Refresh Assigned List", command=self.refresh_assigned)
-        self.refresh_btn.pack(fill="x")
-
-        # ------------------ LOG AREA ------------------
-        self.log_area = tk.Frame(self.root)
-        self.log_area.pack(fill="both", expand=True, padx=10, pady=10)
-
-        self.log_header = tk.Frame(self.log_area)
-        self.log_header.pack(fill="x", anchor="w")
-
-        self.log_label = tk.Label(self.log_header, text="Log:")
-        self.log_label.pack(side="left", anchor="w")
-
-        self.progress = ttk.Progressbar(self.log_header, orient="horizontal", mode="determinate", length=260)
-        self.progress.pack(side="right", padx=(10, 0), pady=(0, 2))
-        self.progress["maximum"] = 1
-        self.progress["value"] = 0
-
-        self.log_box = SafeScrolledText(self.log_area, width=120, height=10)
-        self.log_box.pack(fill="both", expand=True)
-        self.log_box.set_readonly(True)
-
-        self.clear_log_btn = tk.Button(self.log_area, text="Clear Log", command=self.clear_log)
-        self.clear_log_btn.pack(anchor="e", pady=(5, 0))
-
-        # ------------------ EVENT BINDINGS ------------------
-        self.nic_combo.bind("<<ComboboxSelected>>", self.on_nic_change)
-        self.theme_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_theme())
+        # Click-to-toggle checkboxes in assigned list
         self.assigned_box.text.bind("<Button-1>", self._on_assigned_click)
 
-        # ------------------ INIT (FAST STARTUP) ------------------
-        self.apply_theme()
+        # ---------------- BUTTON ROWS ----------------
+        self.left_btns = ttk.Frame(self.left)
+        self.left_btns.pack(fill="x", pady=8)
 
-        # IMPORTANT: do slow netsh / powershell calls off the UI thread
-        self.nic_combo["values"] = ["(Loading adapters...)"]
-        try:
-            self.nic_combo.current(0)
-        except:
-            pass
+        self.add_btn = ttk.Button(self.left_btns, text="Add IPs to Adapter", command=self.add_ips)
+        self.add_btn.pack(side="left", expand=True, fill="x")
 
-        self._startup_q = queue.Queue()
-        self._refresh_q = queue.Queue()
-        self._startup_thread = None
-        self._refresh_thread = None
-        self._last_log_flush = 0.0
+        self.clear_btn = ttk.Button(self.left_btns, text="Clear List", command=self.input_box.clear)
+        self.clear_btn.pack(side="left", padx=(5, 0))
 
-        self.root.after(10, self._startup_async)
+        self.right_btns = ttk.Frame(self.right)
+        self.right_btns.pack(fill="x", pady=8)
 
-    def _collect_netsh_error_lines(self, out: str, err: str):
-        combined = "\n".join([out or "", err or ""]).strip()
-        if not combined:
-            return []
-        bad_tokens = ("error", "failed", "cannot", "invalid", "denied")
-        return [
-            ln.strip()
-            for ln in combined.splitlines()
-            if ln.strip() and any(tok in ln.lower() for tok in bad_tokens)
-        ]
+        self.remove_btn = ttk.Button(self.right_btns, text="Remove ALL Assigned IPs", command=self.remove_all)
+        self.remove_btn.pack(side="left", expand=True, fill="x")
 
-    # ------------------ STARTUP LOAD (DEFERRED) ------------------
-    def _startup_load(self):
-        # populate NICs (netsh can be slow)
+        self.remove_selected_btn = ttk.Button(self.right_btns, text="Remove Selected", command=self.remove_selected)
+        self.remove_selected_btn.pack(side="left", padx=(5, 0))
+
+        self.refresh_btn = ttk.Button(self.right_btns, text="Refresh Assigned List", command=self.refresh_assigned)
+        self.refresh_btn.pack(side="left", padx=(5, 0))
+
+        # ---------------- LOG AREA ----------------
+        ttk.Label(self.root, text="Log:").pack(anchor="w", padx=15)
+
+        self.log_box = SafeScrolledText(self.root, width=120, height=10)
+        self.log_box.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        self.log_box.set_readonly(True)
+
+        self.clear_log_btn = ttk.Button(self.root, text="Clear Log", command=self.clear_log)
+        self.clear_log_btn.pack(anchor="e", padx=15, pady=(0, 10))
+
+        # Load NICs
         self.nic_combo["values"] = get_nics()
         if self.nic_combo["values"]:
             self.nic_combo.current(0)
-            self.nic_var.set(self.nic_combo.get())
 
-        # refresh assigned list (PowerShell can be slow)
         self.refresh_assigned()
 
-    # ------------------ ASYNC STARTUP / REFRESH ------------------
-    def _startup_async(self):
-        # avoid starting multiple startup threads
-        if self._startup_thread is not None and self._startup_thread.is_alive():
-            return
+    # ---------------- Small helpers ----------------
+    def _set_busy(self, busy: bool):
+        state = "disabled" if busy else "normal"
+        self.add_btn.configure(state=state)
+        self.clear_btn.configure(state=state)
+        self.remove_btn.configure(state=state)
+        self.remove_selected_btn.configure(state=state)
+        self.refresh_btn.configure(state=state)
+        self.clear_log_btn.configure(state=state)
+        self.nic_combo.configure(state="disabled" if busy else "readonly")
+        self.mask_entry.configure(state="disabled" if busy else "normal")
 
-        self._startup_thread = threading.Thread(target=self._startup_worker, daemon=True)
-        self._startup_thread.start()
-        self.root.after(50, self._startup_poll)
-
-    def _startup_worker(self):
-        # run slow OS calls off the UI thread
-        nics = get_nics()
-        first = nics[0] if nics else ""
-        ips = get_assigned_ips(first, prefer="netsh") if first else []
-        self._startup_q.put(("startup", nics, first, ips))
-
-    def _startup_poll(self):
-        try:
-            _, nics, first, ips = self._startup_q.get_nowait()
-        except queue.Empty:
-            if self._startup_thread is not None and self._startup_thread.is_alive():
-                self.root.after(50, self._startup_poll)
-            return
-
-        # update UI
-        self.nic_combo["values"] = nics if nics else ["(No adapters found)"]
-        if nics:
-            self.nic_var.set(first)
+    def _run_in_thread(self, work_fn, done_fn=None):
+        def worker():
             try:
-                self.nic_combo.current(0)
-            except:
-                pass
+                result = work_fn()
+                if done_fn:
+                    self.root.after(0, lambda: done_fn(result, None))
+            except Exception as e:
+                if done_fn:
+                    self.root.after(0, lambda: done_fn(None, e))
 
-        old = dict(self.assigned_checks)
-        self.assigned_checks = {ip: bool(old.get(ip, False)) for ip in ips}
-        self._render_assigned_with_checks(ips)
+        threading.Thread(target=worker, daemon=True).start()
 
-        if first:
-            self.assigned_label.config(text=f"IPs Currently Assigned to Adapter: {first}")
-        else:
-            self.assigned_label.config(text="IPs Currently Assigned to Adapter:")
+    # ---------------- LOGGING ----------------
+    def log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_box.append_line(f"[{ts}] {msg}")
 
-    def refresh_assigned(self):
-        # async refresh to keep UI responsive on slower/locked-down machines
-        nic = self.nic_var.get().strip()
-        if not nic:
-            self.assigned_box.set_text([])
-            return
+    def clear_log(self):
+        self.log_box.clear()
 
-        # don't refresh while add/remove netsh batches are in flight
-        if self._op is not None:
-            return
-
-        if self._refresh_thread is not None and self._refresh_thread.is_alive():
-            return
-
-        self._set_busy(True)
-        self._refresh_thread = threading.Thread(target=self._refresh_worker, args=(nic,), daemon=True)
-        self._refresh_thread.start()
-        self.root.after(50, self._refresh_poll)
-
-    def _refresh_worker(self, nic: str):
-        ips = get_assigned_ips(nic, prefer="netsh")
-        self._refresh_q.put(("refresh", nic, ips))
-
-    def _refresh_poll(self):
-        try:
-            _, nic, ips = self._refresh_q.get_nowait()
-        except queue.Empty:
-            if self._refresh_thread is not None and self._refresh_thread.is_alive():
-                self.root.after(50, self._refresh_poll)
-            else:
-                self._set_busy(False)
-            return
-
-        old = dict(self.assigned_checks)
-        self.assigned_checks = {ip: bool(old.get(ip, False)) for ip in ips}
-        self._render_assigned_with_checks(ips)
-        self.assigned_label.config(text=f"IPs Currently Assigned to Adapter: {nic}")
-        self._set_busy(False)
-
-
-    # --------------------------------------------------
-    # Assigned list w/ checkboxes
-    # --------------------------------------------------
+    # ---------------- ASSIGNED LIST (CHECKBOX RENDER) ----------------
     def _render_assigned_with_checks(self, ips):
+        old = dict(self.assigned_checks)
+        self.assigned_checks = {ip: bool(old.get(ip, False)) for ip in ips}
+
         lines = []
         for ip in ips:
-            checked = bool(self.assigned_checks.get(ip, False))
-            lines.append(f"{CHECK_ON if checked else CHECK_OFF} {ip}")
+            lines.append(f"{CHECK_ON if self.assigned_checks.get(ip) else CHECK_OFF} {ip}")
         self.assigned_box.set_text(lines)
 
     def _on_assigned_click(self, event):
@@ -445,11 +339,10 @@ class IPUtilityApp:
             line_s, col_s = idx.split(".")
             line = int(line_s)
             col = int(col_s)
-        except:
+        except Exception:
             return
 
-        # only toggle if click in checkbox area
-        if col > 1:
+        if col > 2:
             return
 
         line_text = t.get(f"{line}.0", f"{line}.end").strip()
@@ -479,486 +372,310 @@ class IPUtilityApp:
     def _get_selected_assigned_ips(self):
         return [ip for ip, checked in self.assigned_checks.items() if checked]
 
-    # --------------------------------------------------
-    # THEME ENGINE (Text-safe)
-    # --------------------------------------------------
-    def apply_theme(self):
-        if self.theme_var.get() == "Light Mode":
-            self.apply_light()
-        else:
-            self.apply_dark()
+    # ---------------- REFRESH (NON-BLOCKING) ----------------
+    def refresh_assigned(self):
+        nic = self.nic_var.get()
 
-    def _apply_text_colors(self, widget, bg, fg, insertbg):
-        txt = widget.text
-        old_state = txt.cget("state")
-        txt.configure(state="normal")
-        txt.configure(bg=bg, fg=fg, insertbackground=insertbg)
-        txt.configure(state=old_state)
+        self._set_busy(True)
+        self.log("Refreshing assigned IP list...")
 
-    def apply_dark(self):
-        bg = "#121212"
-        fg = "#ffffff"
-        boxbg = "#1e1e1e"
+        def work():
+            return get_assigned_ips(nic)
 
-        for w in [self.root, self.top, self.columns, self.left, self.right, self.log_area, self.log_header, self.remove_row]:
-            w.configure(bg=bg)
+        def done(ips, err):
+            try:
+                if err:
+                    self.log(f"ERROR: {err}")
+                    return
+                self._render_assigned_with_checks(ips)
+                self.log(f"Found {len(ips)} IPv4 address(es). ")
+            finally:
+                self._set_busy(False)
 
-        for lbl in [self.left_label, self.assigned_label, self.log_label]:
-            lbl.configure(bg=bg, fg=fg)
+        self._run_in_thread(work, done)
 
-        self.mask_entry.configure(bg=boxbg, fg=fg, insertbackground="white")
-
-        for s in [self.input_box, self.assigned_box, self.log_box]:
-            self._apply_text_colors(s, boxbg, fg, "white")
-            s.scroll.configure(bg=bg)
-
-        self.left_btns.configure(bg=bg)
-
-        self.add_btn.configure(bg="#005a9e", fg="white")
-        self.clear_btn.configure(bg="#005a9e", fg="white")
-        self.excel_btn.configure(bg="#3a3a3a", fg="white")
-        self.remove_btn.configure(bg="#b83838", fg="white")
-        self.remove_selected_btn.configure(bg="#b83838", fg="white")
-        self.refresh_btn.configure(bg="#3a3a3a", fg="white")
-
-    def apply_light(self):
-        bg = "#ffffff"
-        fg = "#000000"
-        boxbg = "#ffffff"
-
-        for w in [self.root, self.top, self.columns, self.left, self.right, self.log_area, self.log_header, self.remove_row]:
-            w.configure(bg=bg)
-
-        for lbl in [self.left_label, self.assigned_label, self.log_label]:
-            lbl.configure(bg=bg, fg=fg)
-
-        self.mask_entry.configure(bg=boxbg, fg=fg, insertbackground="black")
-
-        for s in [self.input_box, self.assigned_box, self.log_box]:
-            self._apply_text_colors(s, boxbg, fg, "black")
-            s.scroll.configure(bg="#efefef")
-
-        self.left_btns.configure(bg=bg)
-
-        self.add_btn.configure(bg="#d4e8ff", fg="black")
-        self.clear_btn.configure(bg="#d4e8ff", fg="black")
-        self.excel_btn.configure(bg="#d0d0d0", fg="black")
-        self.remove_btn.configure(bg="#f2b3b3", fg="black")
-        self.remove_selected_btn.configure(bg="#f2b3b3", fg="black")
-        self.refresh_btn.configure(bg="#d0d0d0", fg="black")
-
-    # --------------------------------------------------
-    # LOGGING
-    # --------------------------------------------------
-    def log(self, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
-        entry = f"[{ts}] {msg}"
-        self.logs.append(entry)
-        if len(self.logs) > 500:
-            self.logs = self.logs[-500:]
-        self.log_box.append_line(entry)
-
-        # Throttle GUI flushes (massive speedup when adding/removing many IPs)
-        now = time.time()
-        if now - getattr(self, "_last_log_flush", 0.0) >= 0.05:
-            self._last_log_flush = now
-            self.root.update_idletasks()
-
-    def clear_log(self):
-        self.logs = []
-        self.log_box.set_readonly(False)
-        self.log_box.clear()
-        self.log_box.set_readonly(True)
-
-    # --------------------------------------------------
-    # Progress / Busy
-    # --------------------------------------------------
-    def _progress_reset(self):
-        self.progress["maximum"] = 1
-        self.progress["value"] = 0
-        self.root.update_idletasks()
-
-    def _progress_start(self, total: int, initial: int = 0):
-        self.progress["maximum"] = max(1, int(total))
-        self.progress["value"] = int(initial)
-        self.root.update_idletasks()
-
-    def _progress_add(self, delta: int):
-        self.progress["value"] = int(self.progress["value"] + int(delta))
-        self.root.update_idletasks()
-
-    def _set_busy(self, busy: bool):
-        state_btn = "disabled" if busy else "normal"
-        self.add_btn.configure(state=state_btn)
-        self.remove_btn.configure(state=state_btn)
-        self.remove_selected_btn.configure(state=state_btn)
-        self.refresh_btn.configure(state=state_btn)
-        self.excel_btn.configure(state=state_btn)
-        self.clear_btn.configure(state=state_btn)
-        self.nic_combo.configure(state="disabled" if busy else "readonly")
-        self.theme_combo.configure(state="disabled" if busy else "readonly")
-        self.mask_entry.configure(state="disabled" if busy else "normal")
-        self.root.update_idletasks()
-
-    # --------------------------------------------------
-    # NIC CHANGE / REFRESH
-    # --------------------------------------------------
-    def on_nic_change(self, event=None):
-        nic = self.nic_var.get().strip()
-        self.assigned_label.config(text=f"IPs Currently Assigned to Adapter: {nic}")
-        self.refresh_assigned()
-
-
-    # --------------------------------------------------
-    # Batch netsh helpers
-    # --------------------------------------------------
-    def _write_netsh_script(self, lines):
-        tf = tempfile.NamedTemporaryFile(delete=False, mode="w", encoding="utf-8", suffix=".txt")
-        try:
-            for ln in lines:
-                tf.write(ln.rstrip() + "\n")
-            tf.flush()
-            return tf.name
-        finally:
-            tf.close()
-
-    def _start_batch_process(self, script_path):
-        return popen_hidden(["netsh", "-f", script_path])
-
-    def _cleanup_script(self, path):
-        try:
-            os.remove(path)
-        except:
-            pass
-
-    # --------------------------------------------------
-    # ADD IPS (batched)
-    # --------------------------------------------------
+    # ---------------- ADD IPs (NON-BLOCKING + NO DUPES + VERIFY + ERROR DETAILS) ----------------
     def add_ips(self):
-        if self._op is not None:
-            return
-
-        if not is_admin():
-            messagebox.showerror("Error", "Run this program as Administrator.")
-            return
-
-        nic = self.nic_var.get().strip()
+        nic = self.nic_var.get()
         mask = self.mask_entry.get().strip()
 
-        raw_ips = [ip for ip in self.input_box.get_lines() if is_valid_ip(ip)]
-        if not raw_ips:
-            messagebox.showerror("Error", "No valid IPs found.")
+        raw_lines = self.input_box.get_lines()
+        valid = [ip for ip in raw_lines if is_valid_ip(ip)]
+
+        if not valid:
+            messagebox.showerror("Error", "No valid IPs.")
             return
 
-        existing = set(get_assigned_ips(nic, prefer="netsh"))
-
-        pending = []
-        skipped = 0
-        for ip in raw_ips:
-            if ip in existing:
-                self.log(f"SKIP (already assigned): {ip}")
-                skipped += 1
-            else:
-                pending.append(ip)
-
-        total = len(raw_ips)
+        # De-dupe the pasted list while preserving order
+        seen = set()
+        ips_unique = []
+        dup_in_input = 0
+        for ip in valid:
+            if ip in seen:
+                dup_in_input += 1
+                continue
+            seen.add(ip)
+            ips_unique.append(ip)
 
         self._set_busy(True)
-        self._progress_start(total, initial=skipped)
+        self.log(f"Adding {len(ips_unique)} IP(s)...")
 
-        if not pending:
-            self.log(f"Finished. Added 0, skipped {skipped}.")
-            self.refresh_assigned()
-            self.input_box.clear()
-            self._progress_reset()
-            self._set_busy(False)
-            return
+        def work():
+            existing = set(get_assigned_ips_verify(nic))
+            pending = [ip for ip in ips_unique if ip not in existing]
+            already = [ip for ip in ips_unique if ip in existing]
 
-        self._op = {
-            "type": "add",
-            "nic": nic,
-            "mask": mask,
-            "pending": pending,
-            "index": 0,
-            "skipped": skipped,
-            "added": 0,
-            "errors": 0,
-            "proc": None,
-            "script": None,
-            "batch_ips": None,
-            "netsh_errors": [],
-        }
+            added = []
+            failed = []
 
-        self._add_run_next_batch()
+            for i in range(0, len(pending), BATCH_SIZE):
+                batch = pending[i:i + BATCH_SIZE]
 
-    def _add_run_next_batch(self):
-        op = self._op
-        if not op or op["type"] != "add":
-            return
+                # run netsh batch
+                script_lines = [
+                    f'interface ipv4 add address name="{nic}" address={ip} mask={mask} store=persistent'
+                    for ip in batch
+                ]
+                script_path = self._write_netsh_script(script_lines)
 
-        if op["proc"] is not None:
-            self._add_poll_proc()
-            return
+                try:
+                    proc = popen_hidden(["netsh", "-f", script_path])
+                    out, err = proc.communicate()
+                    rc = proc.returncode
+                finally:
+                    try:
+                        os.remove(script_path)
+                    except Exception:
+                        pass
 
-        pending = op["pending"]
-        idx = op["index"]
-        if idx >= len(pending):
-            current = set(get_assigned_ips(op["nic"], prefer="netsh"))
-            for ip in pending:
-                if ip in current:
-                    self.log(f"SUCCESS: {ip}")
-                    op["added"] += 1
-                else:
-                    self.log(f"ERROR adding {ip}: IP not observed after operation")
-                    op["errors"] += 1
+                # VERIFY after batch
+                current = set(get_assigned_ips_verify(nic))
 
-            for err_ln in op.get("netsh_errors", []):
-                self.log(f"netsh: {err_ln}")
+                for ip in batch:
+                    if ip in current:
+                        added.append(ip)
+                    else:
+                        details = (err or out or "").strip()
+                        if not details:
+                            details = f"(netsh rc={rc}, but IP not observed after verification)"
+                        failed.append((ip, details))
 
-            self.log(f"Finished. Added {op['added']}, skipped {op['skipped']}, errors {op['errors']}.")
-            self._op = None
-            self.refresh_assigned()
-            self.input_box.clear()
-            self._progress_reset()
-            self._set_busy(False)
-            return
+            return (added, failed, already, dup_in_input)
 
-        batch = pending[idx: idx + BATCH_SIZE]
-        op["batch_ips"] = batch
-        op["index"] = idx + len(batch)
+        def done(result, err):
+            try:
+                if err:
+                    self.log(f"ERROR: {err}")
+                    messagebox.showerror("Error", str(err))
+                    return
 
-        script_lines = []
-        for ip in batch:
-            self.log(f"ADDING: {ip}")
-            script_lines.append(
-                f'interface ipv4 add address name="{op["nic"]}" address={ip} mask={op["mask"]} store=persistent'
-            )
+                added, failed, already, dup_in_input_local = result
 
-        script_path = self._write_netsh_script(script_lines)
-        op["script"] = script_path
-        op["proc"] = self._start_batch_process(script_path)
+                if dup_in_input_local:
+                    self.log(f"Skipped {dup_in_input_local} duplicate IP(s) in the pasted list.")
 
-        self.root.after(50, self._add_poll_proc)
+                for ip in already:
+                    self.log(f"SKIP (already on NIC): {ip}")
 
-    def _add_poll_proc(self):
-        op = self._op
-        if not op or op["type"] != "add" or op["proc"] is None:
-            return
+                for ip in added:
+                    self.log(f"Added: {ip}")
 
-        p = op["proc"]
-        rc = p.poll()
-        if rc is None:
-            self.root.after(75, self._add_poll_proc)
-            return
+                # This is the part you asked for: netsh elevation errors show here
+                if failed:
+                    self.log(f"Removed 0 IP(s).")  # keep your same style/feel if you like
+                    self.log(f"FAILED to add {len(failed)} IP(s). Showing first 10:")
+                    for ip, details in failed[:10]:
+                        self.log(f"  {ip} -> {details}")
+                    if len(failed) > 10:
+                        self.log(f"...and {len(failed) - 10} more failures.")
+                    # Optional: popup (comment out if you only want log)
+                    messagebox.showwarning(
+                        "Some IPs not added",
+                        f"Added {len(added)} IP(s), but {len(failed)} failed.\nCheck Log for details."
+                    )
 
-        out, err = p.communicate()
-        self._cleanup_script(op["script"])
+                if not added and not failed and (already or dup_in_input_local):
+                    self.log("No new IPs needed to be added.")
 
-        op["proc"] = None
-        op["script"] = None
-        if rc != 0:
-            op["netsh_errors"].append(f"batch exited with code {rc}")
-        op["netsh_errors"].extend(self._collect_netsh_error_lines(out, err))
+                self.refresh_assigned()
+                self.input_box.clear()
+            finally:
+                self._set_busy(False)
 
-        self._progress_add(len(op["batch_ips"]))
-        op["batch_ips"] = None
+        self._run_in_thread(work, done)
 
-        self.root.after(1, self._add_run_next_batch)
-
-    # --------------------------------------------------
-    # REMOVE helpers
-    # --------------------------------------------------
-    def _begin_remove(self, ips, mode_label: str):
-        if self._op is not None:
-            return False
-
-        if not is_admin():
-            messagebox.showerror("Error", "Run this program as Administrator.")
-            return False
-
-        nic = self.nic_var.get().strip()
-
-        if not ips:
-            self.log("No IPs to remove.")
-            self._progress_reset()
-            return False
-
-        self.log(f"Removing {len(ips)} IPs ({mode_label})...")
-
-        self._set_busy(True)
-        self._progress_start(len(ips), initial=0)
-
-        self._op = {
-            "type": "remove",
-            "mode": mode_label,
-            "nic": nic,
-            "ips": ips,
-            "index": 0,
-            "removed": 0,
-            "errors": 0,
-            "proc": None,
-            "script": None,
-            "batch_ips": None,
-            "netsh_errors": [],
-        }
-
-        self._remove_run_next_batch()
-        return True
-
+    # ---------------- REMOVE ALL (NETSH + VERIFY) ----------------
     def remove_all(self):
-        nic = self.nic_var.get().strip()
-        ips = get_assigned_ips(nic, prefer="netsh")
-        self._begin_remove(ips, "all")
+        nic = self.nic_var.get()
 
+        self._set_busy(True)
+        self.log("Removing all assigned IPs...")
+
+        def work():
+            ips = get_assigned_ips_verify(nic)
+            if not ips:
+                return ([], [])
+
+            removed = []
+            failed = []
+
+            for i in range(0, len(ips), BATCH_SIZE):
+                batch = ips[i:i + BATCH_SIZE]
+
+                script_lines = [
+                    f'interface ipv4 delete address name="{nic}" address={ip}'
+                    for ip in batch
+                ]
+                script_path = self._write_netsh_script(script_lines)
+
+                try:
+                    proc = popen_hidden(["netsh", "-f", script_path])
+                    out, err = proc.communicate()
+                    rc = proc.returncode
+                finally:
+                    try:
+                        os.remove(script_path)
+                    except Exception:
+                        pass
+
+                current = set(get_assigned_ips_verify(nic))
+
+                for ip in batch:
+                    if ip not in current:
+                        removed.append(ip)
+                    else:
+                        details = (err or out or "").strip()
+                        if not details:
+                            details = f"(netsh rc={rc}, but IP still present after verification)"
+                        failed.append((ip, details))
+
+            return (removed, failed)
+
+        def done(result, err):
+            try:
+                if err:
+                    self.log(f"ERROR: {err}")
+                    messagebox.showerror("Error", str(err))
+                    return
+
+                removed, failed = result
+
+                for ip in removed:
+                    self.assigned_checks.pop(ip, None)
+
+                self.log(f"Removed {len(removed)} IP(s).")
+                if failed:
+                    self.log(f"FAILED to remove {len(failed)} IP(s). Showing first 10:")
+                    for ip, details in failed[:10]:
+                        self.log(f"  {ip} -> {details}")
+                    if len(failed) > 10:
+                        self.log(f"...and {len(failed) - 10} more failures.")
+                    messagebox.showwarning(
+                        "Some IPs not removed",
+                        f"Removed {len(removed)} IP(s), but {len(failed)} failed.\nCheck Log for details."
+                    )
+
+                self.refresh_assigned()
+            finally:
+                self._set_busy(False)
+
+        self._run_in_thread(work, done)
+
+    # ---------------- REMOVE SELECTED ----------------
     def remove_selected(self):
+        nic = self.nic_var.get()
         selected = self._get_selected_assigned_ips()
         if not selected:
-            messagebox.showinfo("Remove Selected", "No IPs are selected.")
+            messagebox.showinfo("Remove Selected", "No IPs selected.")
             return
 
-        nic = self.nic_var.get().strip()
-        current = set(get_assigned_ips(nic, prefer="netsh"))
-        selected = [ip for ip in selected if ip in current]
+        self._set_busy(True)
+        self.log(f"Removing {len(selected)} selected IP(s)...")
 
-        if not selected:
-            messagebox.showinfo("Remove Selected", "Selected IPs are not currently assigned (refresh list).")
-            self.refresh_assigned()
-            return
+        def work():
+            current_set = set(get_assigned_ips_verify(nic))
+            targets = [ip for ip in selected if ip in current_set]
+            if not targets:
+                return ([], [], [])
 
-        self._begin_remove(selected, "selected")
+            removed = []
+            failed = []
+            missing = [ip for ip in selected if ip not in current_set]
 
-    def _remove_run_next_batch(self):
-        op = self._op
-        if not op or op["type"] != "remove":
-            return
+            for i in range(0, len(targets), BATCH_SIZE):
+                batch = targets[i:i + BATCH_SIZE]
 
-        if op["proc"] is not None:
-            self._remove_poll_proc()
-            return
+                script_lines = [
+                    f'interface ipv4 delete address name="{nic}" address={ip}'
+                    for ip in batch
+                ]
+                script_path = self._write_netsh_script(script_lines)
 
-        ips = op["ips"]
-        idx = op["index"]
-        if idx >= len(ips):
-            current = set(get_assigned_ips(op["nic"], prefer="netsh"))
-            for ip in ips:
-                if ip not in current:
-                    self.log(f"SUCCESS removing {ip}")
-                    op["removed"] += 1
-                    if ip in self.assigned_checks:
-                        self.assigned_checks[ip] = False
+                try:
+                    proc = popen_hidden(["netsh", "-f", script_path])
+                    out, err = proc.communicate()
+                    rc = proc.returncode
+                finally:
+                    try:
+                        os.remove(script_path)
+                    except Exception:
+                        pass
+
+                after = set(get_assigned_ips_verify(nic))
+
+                for ip in batch:
+                    if ip not in after:
+                        removed.append(ip)
+                    else:
+                        details = (err or out or "").strip()
+                        if not details:
+                            details = f"(netsh rc={rc}, but IP still present after verification)"
+                        failed.append((ip, details))
+
+            return (removed, failed, missing)
+
+        def done(result, err):
+            try:
+                if err:
+                    self.log(f"ERROR: {err}")
+                    messagebox.showerror("Error", str(err))
+                    return
+
+                removed, failed, missing = result
+
+                for ip in removed:
+                    self.log(f"Removed: {ip}")
+                    self.assigned_checks.pop(ip, None)
+
+                for ip in missing:
+                    self.log(f"SKIP (not currently on NIC): {ip}")
+                    self.assigned_checks[ip] = False
+
+                if failed:
+                    self.log(f"FAILED to remove {len(failed)} IP(s). Showing first 10:")
+                    for ip, details in failed[:10]:
+                        self.log(f"  {ip} -> {details}")
+                    if len(failed) > 10:
+                        self.log(f"...and {len(failed) - 10} more failures.")
+                    messagebox.showwarning(
+                        "Some IPs not removed",
+                        f"Removed {len(removed)} IP(s), but {len(failed)} failed.\nCheck Log for details."
+                    )
                 else:
-                    self.log(f"ERROR removing {ip}: IP still observed after operation")
-                    op["errors"] += 1
+                    self.log(f"Removed {len(removed)} selected IP(s).")
 
-            for err_ln in op.get("netsh_errors", []):
-                self.log(f"netsh: {err_ln}")
+                self.refresh_assigned()
+            finally:
+                self._set_busy(False)
 
-            if op.get("mode") == "selected":
-                self.log(f"Finished removing selected: {op['removed']} removed. Errors {op['errors']}.")
-            else:
-                self.log(f"Finished removing {op['removed']} IPs. Errors {op['errors']}.")
-            self._op = None
-            self.refresh_assigned()
-            self._progress_reset()
-            self._set_busy(False)
-            return
+        self._run_in_thread(work, done)
 
-        batch = ips[idx: idx + BATCH_SIZE]
-        op["batch_ips"] = batch
-        op["index"] = idx + len(batch)
-
-        script_lines = []
-        for ip in batch:
-            self.log(f"DELETING: {ip}")
-            script_lines.append(f'interface ipv4 delete address name="{op["nic"]}" address={ip}')
-
-        script_path = self._write_netsh_script(script_lines)
-        op["script"] = script_path
-        op["proc"] = self._start_batch_process(script_path)
-
-        self.root.after(50, self._remove_poll_proc)
-
-    def _remove_poll_proc(self):
-        op = self._op
-        if not op or op["type"] != "remove" or op["proc"] is None:
-            return
-
-        p = op["proc"]
-        rc = p.poll()
-        if rc is None:
-            self.root.after(75, self._remove_poll_proc)
-            return
-
-        out, err = p.communicate()
-        self._cleanup_script(op["script"])
-
-        op["proc"] = None
-        op["script"] = None
-        if rc != 0:
-            op["netsh_errors"].append(f"batch exited with code {rc}")
-        op["netsh_errors"].extend(self._collect_netsh_error_lines(out, err))
-
-        self._progress_add(len(op["batch_ips"]))
-        op["batch_ips"] = None
-
-        self.root.after(1, self._remove_run_next_batch)
-
-    # --------------------------------------------------
-    # EXCEL IMPORT (lazy import openpyxl)
-    # --------------------------------------------------
-    def load_excel(self):
-        file = filedialog.askopenfilename(
-            title="Select Excel File",
-            filetypes=[("Excel Files", "*.xlsx *.xlsm *.xltx *.xltm")]
-        )
-        if not file:
-            return
-
-        try:
-            import openpyxl  # lazy-load to speed up app startup
-        except:
-            messagebox.showerror("Error", "openpyxl is not installed. Run: pip install openpyxl")
-            return
-
-        try:
-            wb = openpyxl.load_workbook(file, data_only=True)
-        except:
-            messagebox.showerror("Error", "Could not open file.")
-            return
-
-        sheet = None
-        for name in wb.sheetnames:
-            if name.lower() == "sources":
-                sheet = wb[name]
-                break
-
-        if sheet is None:
-            messagebox.showerror("Error", "Sheet 'Sources' not found.")
-            return
-
-        header_row = None
-        for row in sheet.iter_rows(min_row=1, max_row=5, values_only=True):
-            if not row:
-                continue
-            lower = [str(c).strip().lower() if c else "" for c in row]
-            if "routing add" in lower:
-                header_row = lower
-                break
-
-        if header_row is None:
-            messagebox.showerror("Error", "Column 'ROUTING ADD' not found.")
-            return
-
-        col_index = header_row.index("routing add") + 1
-
-        ips = []
-        for row in sheet.iter_rows(min_row=2, values_only=True):
-            val = row[col_index - 1]
-            if val and isinstance(val, str) and is_valid_ip(val):
-                ips.append(val)
-
-        self.input_box.set_text(ips)
-        self.log(f"Loaded {len(ips)} IPs from Excel.")
+    def _write_netsh_script(self, lines):
+        tf = tempfile.NamedTemporaryFile(delete=False, mode="w", encoding="utf-8", suffix=".txt")
+        for ln in lines:
+            tf.write(ln + "\n")
+        tf.close()
+        return tf.name
 
     def run(self):
         self.root.mainloop()
