@@ -106,7 +106,7 @@ def get_assigned_ips(nic):
 
 # ----------------------------- REMOVE/VERIFY HELPERS -----------------------------
 def _get_assigned_ips_netsh_parse(nic):
-    """Fast/robust verification source for deletes/adds (matches your working code idea)."""
+    """Fast/robust verification source for deletes/adds."""
     try:
         r = run_hidden(["netsh", "interface", "ipv4", "show", "addresses", f'name="{nic}"'])
         if r.returncode != 0:
@@ -129,8 +129,7 @@ def _get_assigned_ips_netsh_parse(nic):
 
 def get_assigned_ips_verify(nic):
     """
-    Use netsh parse for post-delete verification (more consistent with netsh operations).
-    Fall back to PowerShell getter if netsh returns nothing.
+    Use netsh parse for post-delete/add verification; fall back to PowerShell getter.
     """
     ips = _get_assigned_ips_netsh_parse(nic)
     if ips:
@@ -195,6 +194,9 @@ class IPUtilityApp:
         self.root.title("IP Utility")
         self.root.geometry("1000x760")
 
+        # ---- NEW: default cursor for whole app ----
+        self.root.configure(cursor="arrow")
+
         # Native Windows theme
         style = ttk.Style()
         try:
@@ -204,7 +206,6 @@ class IPUtilityApp:
 
         self.root.option_add("*Font", ("Segoe UI", 9))
 
-        # Track check state for "Remove Selected"
         self.assigned_checks = {}  # ip -> bool
 
         # Startup warning only
@@ -242,11 +243,15 @@ class IPUtilityApp:
         ttk.Label(self.left, text="Paste IPs Here").pack(anchor="w")
         self.input_box = SafeScrolledText(self.left, width=50, height=20)
         self.input_box.pack(fill="both", expand=True)
+        # ---- NEW: I-beam only in input box ----
+        self.input_box.text.configure(cursor="xterm")
 
         ttk.Label(self.right, text="IPs Currently Assigned to Adapter").pack(anchor="w")
         self.assigned_box = SafeScrolledText(self.right, width=50, height=20)
         self.assigned_box.pack(fill="both", expand=True)
         self.assigned_box.set_readonly(True)
+        # ---- NEW: assigned list should be arrow ----
+        self.assigned_box.text.configure(cursor="arrow")
 
         # Click-to-toggle checkboxes in assigned list
         self.assigned_box.text.bind("<Button-1>", self._on_assigned_click)
@@ -279,6 +284,8 @@ class IPUtilityApp:
         self.log_box = SafeScrolledText(self.root, width=120, height=10)
         self.log_box.pack(fill="both", expand=True, padx=15, pady=(0, 10))
         self.log_box.set_readonly(True)
+        # ---- NEW: log should be arrow ----
+        self.log_box.text.configure(cursor="arrow")
 
         self.clear_log_btn = ttk.Button(self.root, text="Clear Log", command=self.clear_log)
         self.clear_log_btn.pack(anchor="e", padx=15, pady=(0, 10))
@@ -388,13 +395,13 @@ class IPUtilityApp:
                     self.log(f"ERROR: {err}")
                     return
                 self._render_assigned_with_checks(ips)
-                self.log(f"Found {len(ips)} IPv4 address(es). ")
+                self.log(f"Found {len(ips)} IPv4 address(es). (Click ☑ to select)")
             finally:
                 self._set_busy(False)
 
         self._run_in_thread(work, done)
 
-    # ---------------- ADD IPs (NON-BLOCKING + NO DUPES + VERIFY + ERROR DETAILS) ----------------
+    # ---------------- ADD IPs (VERIFY + ERROR DETAILS like remove) ----------------
     def add_ips(self):
         nic = self.nic_var.get()
         mask = self.mask_entry.get().strip()
@@ -431,7 +438,6 @@ class IPUtilityApp:
             for i in range(0, len(pending), BATCH_SIZE):
                 batch = pending[i:i + BATCH_SIZE]
 
-                # run netsh batch
                 script_lines = [
                     f'interface ipv4 add address name="{nic}" address={ip} mask={mask} store=persistent'
                     for ip in batch
@@ -448,7 +454,6 @@ class IPUtilityApp:
                     except Exception:
                         pass
 
-                # VERIFY after batch
                 current = set(get_assigned_ips_verify(nic))
 
                 for ip in batch:
@@ -480,15 +485,14 @@ class IPUtilityApp:
                 for ip in added:
                     self.log(f"Added: {ip}")
 
-                # This is the part you asked for: netsh elevation errors show here
+                # ---- NEW: mimic remove-style failure output when not admin ----
                 if failed:
-                    self.log(f"Removed 0 IP(s).")  # keep your same style/feel if you like
+                    self.log(f"Added {len(added)} IP(s).")
                     self.log(f"FAILED to add {len(failed)} IP(s). Showing first 10:")
                     for ip, details in failed[:10]:
                         self.log(f"  {ip} -> {details}")
                     if len(failed) > 10:
                         self.log(f"...and {len(failed) - 10} more failures.")
-                    # Optional: popup (comment out if you only want log)
                     messagebox.showwarning(
                         "Some IPs not added",
                         f"Added {len(added)} IP(s), but {len(failed)} failed.\nCheck Log for details."
@@ -586,7 +590,7 @@ class IPUtilityApp:
         nic = self.nic_var.get()
         selected = self._get_selected_assigned_ips()
         if not selected:
-            messagebox.showinfo("Remove Selected", "No IPs selected.")
+            messagebox.showinfo("Remove Selected", "No IPs selected. (Click ☑ next to an IP)")
             return
 
         self._set_busy(True)
